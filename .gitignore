@@ -1,0 +1,33 @@
+# Binaries
+distributed-job-queue
+cmd/api/api
+cmd/worker/worker
+*.exe
+
+# Environment variables
+.env
+.env.*
+
+# Go
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+/tmp/
+
+# Docker
+docker-compose.override.yml
+
+# Test coverage
+*.out
+coverage.html
