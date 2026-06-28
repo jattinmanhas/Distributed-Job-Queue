@@ -24,6 +24,11 @@ type jobProducer interface {
 	Publish(ctx context.Context, topic string, job models.Job) error
 }
 
+// rateLimiter gates job execution behind a per-service rate limit.
+type rateLimiter interface {
+	Allow(ctx context.Context, service string) error
+}
+
 const (
 	statusCompleted = "completed"
 	statusRunning   = "running"
@@ -40,15 +45,17 @@ const (
 type Processor struct {
 	store      jobStore
 	producer   jobProducer
+	limiter    rateLimiter
 	maxRetries int
 	workerID   string
 }
 
 // NewProcessor constructs a Processor.
-func NewProcessor(store jobStore, producer jobProducer, maxRetries int, workerID string) *Processor {
+func NewProcessor(store jobStore, producer jobProducer, limiter rateLimiter, maxRetries int, workerID string) *Processor {
 	return &Processor{
 		store:      store,
 		producer:   producer,
+		limiter:    limiter,
 		maxRetries: maxRetries,
 		workerID:   workerID,
 	}
@@ -92,6 +99,10 @@ func (p *Processor) Process(ctx context.Context, job models.Job) (err error) {
 
 // doWork performs the running -> work -> completed happy path.
 func (p *Processor) doWork(ctx context.Context, job models.Job) error {
+	if err := p.limiter.Allow(ctx, "job_processor"); err != nil {
+		return fmt.Errorf("rate limiter: %w", err)
+	}
+
 	if err := p.store.UpdateJobStatus(ctx, job.JobID, statusRunning, p.workerID); err != nil {
 		return fmt.Errorf("mark running: %w", err)
 	}

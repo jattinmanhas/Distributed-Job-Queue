@@ -10,6 +10,22 @@ This repository is being developed **feature by feature**. The sections marked
 
 ---
 
+## Why this exists
+
+Background job processing is a solved problem in most languages —
+Celery in Python, BullMQ in Node.js, Sidekiq in Ruby. Go has no
+dominant equivalent. This project is a from-scratch implementation
+of a production-grade job queue in Go, built to understand every
+layer: durable submission, at-least-once delivery, concurrent worker
+pools, exponential backoff, dead-letter queues, and distributed rate
+limiting.
+
+Typical use cases: file processing pipelines, email delivery,
+payment webhooks, video transcoding — anything where an HTTP request
+cannot block on slow work.
+
+---
+
 ## Status
 
 | Capability | State |
@@ -18,9 +34,11 @@ This repository is being developed **feature by feature**. The sections marked
 | PostgreSQL-backed durable storage | ✅ Implemented |
 | Job lookup by ID | ✅ Implemented |
 | Health endpoint | ✅ Implemented |
-| Worker pool (goroutine-based execution) | 🚧 Scaffolded |
-| Kafka producer / consumer | 🚧 Scaffolded |
-| Retry & failure handling | 🚧 Scaffolded |
+| Kafka producer / consumer (KRaft, `franz-go`) | ✅ Implemented |
+| Worker pool (goroutine-based execution) | ✅ Implemented |
+| Retry, exponential backoff & dead-letter queue | ✅ Implemented |
+| Redis sliding-window rate limiting | ✅ Implemented |
+| Observability — metrics, structured logs | 🚧 Scaffolded |
 
 ---
 
@@ -36,11 +54,18 @@ These decisions are intentional and load-bearing — the system is built around 
   existing record — so a client that times out and retries never creates a
   duplicate.
 - **PostgreSQL as the source of truth.** Every job's full lifecycle state lives
-  in one table. The message broker (added later) carries work *notifications*,
-  not the authoritative state.
+  in one table. Kafka carries work *notifications*, not the authoritative state.
+- **At-least-once delivery, made safe by idempotency.** The consumer commits a
+  Kafka offset *only after* the job result is persisted to PostgreSQL. A crash
+  between processing and commit means the job is redelivered — and the
+  `completed` idempotency guard in the processor makes re-running it a no-op.
+- **Rate limiting at the processor, not the edge.** The sliding-window check
+  runs in `processor.go` right before work begins — so it throttles actual
+  downstream load regardless of how jobs arrive (REST, Kafka redelivery, retry).
 - **No frameworks, no ORM.** Routing uses [chi](https://github.com/go-chi/chi);
-  database access uses [pgx/v5](https://github.com/jackc/pgx) with `pgxpool`.
-  No Gin/Fiber, no GORM.
+  database access uses [pgx/v5](https://github.com/jackc/pgx) with `pgxpool`;
+  Kafka uses [franz-go](https://github.com/twmb/franz-go); Redis uses
+  [go-redis/v9](https://github.com/redis/go-redis). No Gin/Fiber, no GORM.
 
 ---
 
@@ -51,14 +76,25 @@ These decisions are intentional and load-bearing — the system is built around 
    client ──────▶│   API server │  POST /jobs   (idempotent submit)
  (makes UUID)    │  (cmd/api)   │  GET  /jobs/:id
                  └──────┬───────┘
-                        │
-                        ▼
-                 ┌──────────────┐
-                 │  PostgreSQL  │  jobs table = source of truth
-                 │   (jobqueue) │
-                 └──────────────┘
-
-   🚧 future: API ──▶ Kafka ──▶ worker pool (cmd/worker) ──▶ updates jobs table
+                        │ 1. insert (source of truth)
+                        │ 2. publish to `jobs` topic
+              ┌─────────┴─────────┐
+              ▼                   ▼
+       ┌────────────┐      ┌────────────┐
+       │ PostgreSQL │      │   Kafka    │  topics: jobs, jobs.dlq
+       │ (jobqueue) │      │  (KRaft)   │
+       └─────▲──────┘      └─────┬──────┘
+             │                   │ consume (group: job-workers)
+             │ update status     ▼
+             │            ┌──────────────┐     ┌────────────┐
+             └────────────│ worker pool  │────▶│   Redis    │ rate_limit:{svc}
+              commit after│ (cmd/worker) │     │ sliding win│ sorted set
+              persist     └──────┬───────┘     └────────────┘
+                                 │ retries exhausted → publish to jobs.dlq
+                                 ▼
+                          ┌────────────┐
+                          │  jobs.dlq  │
+                          └────────────┘
 ```
 
 ### Project layout
@@ -66,15 +102,16 @@ These decisions are intentional and load-bearing — the system is built around 
 ```
 .
 ├── cmd/
-│   ├── api/         # HTTP server entrypoint
-│   └── worker/      # worker entrypoint (🚧 scaffold)
+│   ├── api/         # HTTP server entrypoint (publishes to Kafka on submit)
+│   └── worker/      # worker entrypoint: consumer → pool → processor
 ├── internal/
 │   ├── api/         # handlers + chi router
 │   ├── store/       # pgxpool connection, migration, queries
 │   ├── models/      # Job domain type
 │   ├── config/      # env-var configuration
-│   ├── worker/      # 🚧 goroutine pool + processor
-│   └── queue/       # 🚧 Kafka producer + consumer
+│   ├── worker/      # goroutine pool + processor (lifecycle, retries, DLQ)
+│   ├── queue/       # Kafka producer + consumer (franz-go)
+│   └── ratelimit/   # Redis sliding-window limiter
 ├── docker-compose.yml
 ├── Dockerfile
 └── go.mod
@@ -109,13 +146,15 @@ Liveness check. → `200 OK` `{"status":"ok"}`
 
 ### `POST /jobs`
 Submit a job. Body requires `job_id` (string) and `payload` (any valid JSON).
+On a new job the API inserts it into PostgreSQL **and** publishes it to the
+Kafka `jobs` topic (keyed by `job_id` so a job always maps to one partition).
 
 | Response | Meaning |
 |---|---|
-| `202 Accepted` | new job created |
+| `202 Accepted` | new job created and enqueued to Kafka |
 | `200 OK` | job already existed — idempotency hit, returns the stored job |
 | `400 Bad Request` | missing `job_id` / `payload` or invalid JSON |
-| `500` | server/database error |
+| `500` | database error, or Kafka publish failed (the PG insert is *not* rolled back — the job is recorded as `pending` and can be re-published) |
 
 ### `GET /jobs/{id}`
 Fetch a job by ID. → `200 OK` with the job, or `404 Not Found`.
@@ -128,12 +167,15 @@ Fetch a job by ID. → `200 OK` with the job, or `404 Not Found`.
 - Go 1.22+
 - Docker + Docker Compose
 
-### 1. Start PostgreSQL
+### 1. Start the infrastructure
 ```bash
 docker-compose up -d
 ```
-Brings up PostgreSQL 16 (db `jobqueue`, user/password `postgres`) on port `5432`
-with a health check.
+Brings up, each with a health check:
+- **PostgreSQL 16** — db `jobqueue`, user/password `postgres`, port `5432`
+- **Kafka** (`confluentinc/cp-kafka`, KRaft mode — no Zookeeper), port `9092`.
+  Topics `jobs` and `jobs.dlq` are auto-created on first use.
+- **Redis 7** — port `6379`
 
 ### 2. Run the API server
 ```bash
@@ -142,18 +184,37 @@ go run ./cmd/api
 ```
 Listens on `:8080` by default.
 
+### 3. Run the worker
+```bash
+go run ./cmd/worker
+```
+Joins the `job-workers` consumer group, starts a pool of goroutines, and begins
+draining the `jobs` topic. The API and worker are separate binaries and can be
+run/scaled independently.
+
 ### Configuration
 
 All config comes from environment variables (with defaults):
 
-| Variable | Default |
-|---|---|
-| `DB_HOST` | `localhost` |
-| `DB_PORT` | `5432` |
-| `DB_USER` | `postgres` |
-| `DB_PASSWORD` | `postgres` |
-| `DB_NAME` | `jobqueue` |
-| `SERVER_PORT` | `8080` |
+| Variable | Default | Used by |
+|---|---|---|
+| `DB_HOST` | `localhost` | api, worker |
+| `DB_PORT` | `5432` | api, worker |
+| `DB_USER` | `postgres` | api, worker |
+| `DB_PASSWORD` | `postgres` | api, worker |
+| `DB_NAME` | `jobqueue` | api, worker |
+| `SERVER_PORT` | `8080` | api |
+| `KAFKA_BROKERS` | `localhost:9092` | api, worker |
+| `KAFKA_TOPIC` | `jobs` | api, worker |
+| `KAFKA_DLQ_TOPIC` | `jobs.dlq` | worker |
+| `KAFKA_GROUP_ID` | `job-workers` | worker |
+| `WORKER_POOL_SIZE` | `10` | worker |
+| `REDIS_ADDR` | `localhost:6379` | worker |
+| `REDIS_PASSWORD` | `` (empty) | worker |
+| `REDIS_DB` | `0` | worker |
+| `RATE_LIMIT_WINDOW_SECONDS` | `60` | worker |
+| `RATE_LIMIT_MAX_REQUESTS` | `100` | worker |
+| `RATE_LIMIT_RETRY_MS` | `100` | worker |
 
 ---
 
@@ -171,20 +232,73 @@ curl -i -X POST http://localhost:8080/jobs \
 # → 200 OK         (same job_id again — idempotency hit)
 ```
 
-Fetch it back:
+Fetch it back — with the worker running, you'll watch it move
+`pending → running → completed`:
 ```bash
 curl -i http://localhost:8080/jobs/550e8400-e29b-41d4-a716-446655440000
 # → 200 OK
 # {"job_id":"550e8400-...","payload":{"task":"send_email","to":"user@example.com"},
-#  "status":"pending","attempt_count":0,"max_retries":3, ...}
+#  "status":"completed","attempt_count":0,"max_retries":3,"worker_id":"...", ...}
+```
+
+---
+
+## How a job is processed
+
+Each worker goroutine pulls a job off the in-memory channel (fed by the Kafka
+consumer) and runs it through `processor.go`:
+
+1. **Idempotency guard** — if the job is already `completed` in PostgreSQL, skip
+   it and return (safe under at-least-once redelivery).
+2. **Rate limit** — `limiter.Allow(ctx, "job_processor")` blocks until the
+   sliding window admits the request (see below).
+3. **`running`** — set status + `worker_id` + `started_at`.
+4. **Work** — (simulated with a short sleep).
+5. **`completed`** — set status + `completed_at`.
+
+The Kafka offset is committed **only after** the result is persisted. Every
+goroutine has a `defer recover()` so a single bad job can never crash the pool.
+
+### Retries, backoff, and the dead-letter queue
+
+On failure the processor increments `attempt_count` and stores `last_error`:
+
+- `attempt_count < max_retries` → republish to `jobs` with exponential backoff
+  (`2s · 2^attempt + random(0–1s)`).
+- `attempt_count >= max_retries` → mark the job `failed` and publish the
+  enriched job record to the **`jobs.dlq`** topic.
+
+Inspect the dead-letter queue:
+```bash
+docker exec jobqueue-kafka \
+  kafka-console-consumer --topic jobs.dlq --from-beginning \
+  --bootstrap-server localhost:9092
+```
+
+### Rate limiting (Redis sliding window)
+
+Throttling runs in the processor, gating real downstream work. Each service has
+a Redis sorted set `rate_limit:{service}`; a single Lua script atomically evicts
+entries older than the window, counts the rest, and admits (recording a UUID
+member) only if under the limit. When throttled the worker sleeps
+`RATE_LIMIT_RETRY_MS` and retries — it never drops the job.
+
+```bash
+# watch the window fill up while jobs are processing
+docker exec jobqueue-redis redis-cli ZCARD rate_limit:job_processor
+docker exec jobqueue-redis redis-cli ZRANGE rate_limit:job_processor 0 -1 WITHSCORES
+
+# demo: cap at 2 concurrent, submit 5 jobs — 2 proceed, 3 queue behind the limiter
+RATE_LIMIT_MAX_REQUESTS=2 go run ./cmd/worker
 ```
 
 ---
 
 ## Roadmap
 
-1. ✅ **Idempotent submission + durable storage** (this feature)
-2. 🚧 **Worker pool** — goroutine-based execution that claims `pending` jobs
-3. 🚧 **Kafka integration** — producer on submit, consumer feeding the pool
-4. 🚧 **Retries & failure handling** — `attempt_count`, `max_retries`, backoff
-5. 🚧 **Observability** — metrics, structured logs, dead-letter handling
+1. ✅ **Idempotent submission + durable storage**
+2. ✅ **Kafka integration** — producer on submit, consumer feeding the pool
+3. ✅ **Worker pool** — goroutine-based execution with panic recovery
+4. ✅ **Retries & failure handling** — `attempt_count`, `max_retries`, backoff, DLQ
+5. ✅ **Rate limiting** — Redis sliding-window throttle at the processor
+6. 🚧 **Observability** — metrics, structured logs, tracing

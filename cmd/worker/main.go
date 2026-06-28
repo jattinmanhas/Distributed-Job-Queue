@@ -10,6 +10,7 @@ import (
 
 	"github.com/jattin/distributed-job-queue/internal/config"
 	"github.com/jattin/distributed-job-queue/internal/queue"
+	"github.com/jattin/distributed-job-queue/internal/ratelimit"
 	"github.com/jattin/distributed-job-queue/internal/store"
 	"github.com/jattin/distributed-job-queue/internal/worker"
 )
@@ -47,13 +48,26 @@ func main() {
 	}
 	defer consumer.Close()
 
+	limiter, err := ratelimit.NewLimiter(
+		cfg.RedisAddr,
+		cfg.RedisPassword,
+		cfg.RedisDB,
+		cfg.RateLimitWindow,
+		cfg.RateLimitMaxRequests,
+		cfg.RateLimitRetryMs,
+	)
+	if err != nil {
+		log.Fatalf("failed to connect to redis: %v", err)
+	}
+	defer limiter.Close()
+
 	hostname, err := os.Hostname()
 	if err != nil {
 		log.Printf("could not determine hostname, falling back to 'worker': %v", err)
 		hostname = "worker"
 	}
 
-	processor := worker.NewProcessor(st, producer, defaultMaxRetries, hostname)
+	processor := worker.NewProcessor(st, producer, limiter, defaultMaxRetries, hostname)
 	pool := worker.NewPool(cfg.WorkerPoolSize, processor)
 	pool.Start(ctx)
 	log.Printf("worker pool started: host=%s workers=%d topic=%s group=%s",

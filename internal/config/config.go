@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"time"
 )
 
 // Config holds all runtime configuration loaded from environment variables.
@@ -19,6 +20,13 @@ type Config struct {
 	KafkaDLQTopic  string
 	KafkaGroupID   string
 	WorkerPoolSize int
+
+	RedisAddr            string
+	RedisPassword        string
+	RedisDB              int
+	RateLimitWindow      time.Duration
+	RateLimitMaxRequests int64
+	RateLimitRetryMs     time.Duration
 }
 
 // Load reads configuration from the environment, applying sensible defaults.
@@ -36,6 +44,13 @@ func Load() Config {
 		KafkaDLQTopic:  getEnv("KAFKA_DLQ_TOPIC", "jobs.dlq"),
 		KafkaGroupID:   getEnv("KAFKA_GROUP_ID", "job-workers"),
 		WorkerPoolSize: getEnvInt("WORKER_POOL_SIZE", 10),
+
+		RedisAddr:            getEnv("REDIS_ADDR", "localhost:6379"),
+		RedisPassword:        getEnv("REDIS_PASSWORD", ""),
+		RedisDB:              getEnvInt("REDIS_DB", 0),
+		RateLimitWindow:      time.Duration(getEnvInt("RATE_LIMIT_WINDOW_SECONDS", 60)) * time.Second,
+		RateLimitMaxRequests: int64(getEnvInt("RATE_LIMIT_MAX_REQUESTS", 100)),
+		RateLimitRetryMs:     time.Duration(getEnvInt("RATE_LIMIT_RETRY_MS", 100)) * time.Millisecond,
 	}
 }
 
