@@ -4,9 +4,11 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/jattin/distributed-job-queue/internal/api"
 	"github.com/jattin/distributed-job-queue/internal/config"
+	"github.com/jattin/distributed-job-queue/internal/queue"
 	"github.com/jattin/distributed-job-queue/internal/store"
 )
 
@@ -25,7 +27,14 @@ func main() {
 		log.Fatalf("failed to run migration: %v", err)
 	}
 
-	handler := api.NewHandler(st)
+	brokers := strings.Split(cfg.KafkaBrokers, ",")
+	producer, err := queue.NewProducer(brokers)
+	if err != nil {
+		log.Fatalf("failed to create kafka producer: %v", err)
+	}
+	defer producer.Close()
+
+	handler := api.NewHandler(st, producer, cfg.KafkaTopic)
 	router := api.NewRouter(handler)
 
 	addr := ":" + cfg.ServerPort

@@ -18,14 +18,22 @@ type jobStore interface {
 	GetJobByID(ctx context.Context, jobID string) (models.Job, error)
 }
 
-// Handler holds dependencies for the job API handlers.
-type Handler struct {
-	store jobStore
+// jobProducer publishes accepted jobs onto the Kafka jobs topic.
+type jobProducer interface {
+	Publish(ctx context.Context, topic string, job models.Job) error
 }
 
-// NewHandler constructs a Handler with the given store.
-func NewHandler(s jobStore) *Handler {
-	return &Handler{store: s}
+// Handler holds dependencies for the job API handlers.
+type Handler struct {
+	store    jobStore
+	producer jobProducer
+	topic    string
+}
+
+// NewHandler constructs a Handler with the given store and Kafka producer.
+// topic is the Kafka topic onto which accepted jobs are published.
+func NewHandler(s jobStore, p jobProducer, topic string) *Handler {
+	return &Handler{store: s, producer: p, topic: topic}
 }
 
 type createJobRequest struct {
@@ -80,6 +88,15 @@ func (h *Handler) JobHandler(w http.ResponseWriter, r *http.Request) {
 	if err := h.store.InsertJob(ctx, job); err != nil {
 		log.Printf("error inserting job %s: %v", req.JobID, err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+		return
+	}
+
+	// Publish to Kafka after the durable insert. On failure we return 500 but do
+	// NOT roll back the insert: the job is recorded as pending and can be
+	// re-published, and the idempotent insert above makes a client retry safe.
+	if err := h.producer.Publish(ctx, h.topic, job); err != nil {
+		log.Printf("error publishing job %s to kafka topic %s: %v", req.JobID, h.topic, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to enqueue job"})
 		return
 	}
 
