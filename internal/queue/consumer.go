@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 
 	"github.com/jattin/distributed-job-queue/internal/models"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -58,8 +58,8 @@ func (c *Consumer) Start(ctx context.Context, jobsChan chan<- models.Job) error 
 				if errors.Is(fe.Err, context.Canceled) {
 					return ctx.Err()
 				}
-				log.Printf("kafka fetch error on topic %s partition %d: %v",
-					fe.Topic, fe.Partition, fe.Err)
+				slog.Error("kafka fetch error",
+					"topic", fe.Topic, "partition", fe.Partition, "error", fe.Err)
 			}
 			continue
 		}
@@ -73,15 +73,16 @@ func (c *Consumer) Start(ctx context.Context, jobsChan chan<- models.Job) error 
 			if err := json.Unmarshal(rec.Value, &job); err != nil {
 				// A malformed message can never be processed; log and skip it so
 				// it does not block the partition forever.
-				log.Printf("error unmarshaling kafka message (topic=%s partition=%d offset=%d): %v",
-					rec.Topic, rec.Partition, rec.Offset, err)
+				slog.Error("error unmarshaling kafka message",
+					"topic", rec.Topic, "partition", rec.Partition, "offset", rec.Offset, "error", err)
 				return
 			}
 
 			select {
 			case jobsChan <- job:
-				log.Printf("consumed job_id=%s from topic=%s partition=%d offset=%d",
-					job.JobID, rec.Topic, rec.Partition, rec.Offset)
+				slog.Debug("consumed job",
+					"job_id", job.JobID, "topic", rec.Topic,
+					"partition", rec.Partition, "offset", rec.Offset)
 			case <-ctx.Done():
 				pushErr = ctx.Err()
 			}
@@ -96,7 +97,7 @@ func (c *Consumer) Start(ctx context.Context, jobsChan chan<- models.Job) error 
 			if errors.Is(err, context.Canceled) {
 				return ctx.Err()
 			}
-			log.Printf("error committing kafka offsets: %v", err)
+			slog.Error("error committing kafka offsets", "error", err)
 		}
 	}
 }

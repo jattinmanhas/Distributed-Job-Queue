@@ -15,6 +15,9 @@ type Config struct {
 	DBName     string
 	ServerPort string
 
+	LogLevel    string
+	MetricsPort string
+
 	KafkaBrokers   string
 	KafkaTopic     string
 	KafkaDLQTopic  string
@@ -38,6 +41,9 @@ func Load() Config {
 		DBPassword: getEnv("DB_PASSWORD", "postgres"),
 		DBName:     getEnv("DB_NAME", "jobqueue"),
 		ServerPort: getEnv("SERVER_PORT", "8080"),
+
+		LogLevel:    getEnv("LOG_LEVEL", "info"),
+		MetricsPort: getEnv("METRICS_PORT", "2112"),
 
 		KafkaBrokers:   getEnv("KAFKA_BROKERS", "localhost:9092"),
 		KafkaTopic:     getEnv("KAFKA_TOPIC", "jobs"),

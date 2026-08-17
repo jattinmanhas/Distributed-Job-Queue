@@ -2,7 +2,7 @@ package worker
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"sync"
 
 	"github.com/jattin/distributed-job-queue/internal/models"
@@ -42,22 +42,23 @@ func (p *Pool) runWorker(ctx context.Context, index int) {
 		if r := recover(); r != nil {
 			// Processor.Process already recovers per job; this is a last-resort
 			// guard so the goroutine exits cleanly instead of crashing the program.
-			log.Printf("worker %d recovered from panic: %v", index, r)
+			slog.Error("worker recovered from panic", "worker", index, "error", r)
 		}
 	}()
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("worker %d stopping: context cancelled", index)
+			slog.Info("worker stopping: context cancelled", "worker", index)
 			return
 		case job, ok := <-p.jobsChan:
 			if !ok {
-				log.Printf("worker %d stopping: jobs channel closed", index)
+				slog.Info("worker stopping: jobs channel closed", "worker", index)
 				return
 			}
 			if err := p.processor.Process(ctx, job); err != nil {
-				log.Printf("worker %d finished job_id=%s with error: %v", index, job.JobID, err)
+				slog.Error("worker finished job with error",
+					"worker", index, "job_id", job.JobID, "error", err)
 			}
 		}
 	}

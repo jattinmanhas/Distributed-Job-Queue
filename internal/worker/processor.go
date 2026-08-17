@@ -3,10 +3,11 @@ package worker
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/rand"
 	"time"
 
+	"github.com/jattin/distributed-job-queue/internal/metrics"
 	"github.com/jattin/distributed-job-queue/internal/models"
 )
 
@@ -68,7 +69,8 @@ func (p *Processor) Process(ctx context.Context, job models.Job) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic processing job %s: %v", job.JobID, r)
-			log.Printf("recovered panic for job_id=%s worker_id=%s: %v", job.JobID, p.workerID, r)
+			slog.Error("recovered panic while processing job",
+				"job_id", job.JobID, "worker_id", p.workerID, "error", err)
 			p.handleFailure(ctx, job, err)
 		}
 	}()
@@ -76,11 +78,13 @@ func (p *Processor) Process(ctx context.Context, job models.Job) (err error) {
 	// Idempotency guard: a job already completed must never be re-run.
 	current, getErr := p.store.GetJobByID(ctx, job.JobID)
 	if getErr != nil {
-		log.Printf("error loading job_id=%s worker_id=%s: %v", job.JobID, p.workerID, getErr)
+		slog.Error("error loading job",
+			"job_id", job.JobID, "worker_id", p.workerID, "error", getErr)
 		return getErr
 	}
 	if current.Status == statusCompleted {
-		log.Printf("skipping already-completed job_id=%s worker_id=%s (idempotency guard)", job.JobID, p.workerID)
+		slog.Info("skipping already-completed job (idempotency guard)",
+			"job_id", job.JobID, "worker_id", p.workerID)
 		return nil
 	}
 
@@ -88,8 +92,14 @@ func (p *Processor) Process(ctx context.Context, job models.Job) (err error) {
 	job.AttemptCount = current.AttemptCount
 	job.MaxRetries = current.MaxRetries
 
-	if procErr := p.doWork(ctx, job); procErr != nil {
-		log.Printf("processing failed for job_id=%s worker_id=%s: %v", job.JobID, p.workerID, procErr)
+	// Time the full doWork call, covering both the success and failure paths.
+	start := time.Now()
+	procErr := p.doWork(ctx, job)
+	metrics.JobDuration.Observe(time.Since(start).Seconds())
+
+	if procErr != nil {
+		slog.Error("processing failed",
+			"job_id", job.JobID, "worker_id", p.workerID, "error", procErr)
 		p.handleFailure(ctx, job, procErr)
 		return procErr
 	}
@@ -107,8 +117,9 @@ func (p *Processor) doWork(ctx context.Context, job models.Job) error {
 		return fmt.Errorf("mark running: %w", err)
 	}
 
-	log.Printf("processing job_id=%s worker_id=%s attempt=%d payload=%s",
-		job.JobID, p.workerID, job.AttemptCount, string(job.Payload))
+	slog.Info("processing job",
+		"job_id", job.JobID, "worker_id", p.workerID,
+		"attempt", job.AttemptCount, "payload", string(job.Payload))
 
 	// Simulate actual work.
 	select {
@@ -121,7 +132,8 @@ func (p *Processor) doWork(ctx context.Context, job models.Job) error {
 		return fmt.Errorf("mark completed: %w", err)
 	}
 
-	log.Printf("completed job_id=%s worker_id=%s", job.JobID, p.workerID)
+	metrics.JobsProcessed.Inc()
+	slog.Info("job completed", "job_id", job.JobID, "worker_id", p.workerID)
 	return nil
 }
 
@@ -130,47 +142,52 @@ func (p *Processor) doWork(ctx context.Context, job models.Job) error {
 func (p *Processor) handleFailure(ctx context.Context, job models.Job, cause error) {
 	attemptCount, incErr := p.store.IncrementAttempt(ctx, job.JobID, cause.Error())
 	if incErr != nil {
-		log.Printf("error incrementing attempt for job_id=%s worker_id=%s: %v", job.JobID, p.workerID, incErr)
+		slog.Error("error incrementing attempt",
+			"job_id", job.JobID, "worker_id", p.workerID, "error", incErr)
 		return
 	}
 	job.AttemptCount = attemptCount
 
 	if attemptCount >= p.maxRetries {
-		log.Printf("retries exhausted for job_id=%s worker_id=%s (attempt=%d max=%d), routing to DLQ",
-			job.JobID, p.workerID, attemptCount, p.maxRetries)
+		slog.Warn("retries exhausted, routing to DLQ",
+			"job_id", job.JobID, "worker_id", p.workerID,
+			"attempt", attemptCount, "max", p.maxRetries)
 
 		if err := p.store.FailJob(ctx, job.JobID, cause.Error(), attemptCount); err != nil {
-			log.Printf("error marking job_id=%s failed: %v", job.JobID, err)
+			slog.Error("error marking job failed", "job_id", job.JobID, "error", err)
 		}
 
 		// Publish the authoritative, fully-enriched job (status, last_error,
 		// timestamps, worker_id) to the DLQ rather than the sparse in-memory copy.
 		enriched, err := p.store.GetJobByID(ctx, job.JobID)
 		if err != nil {
-			log.Printf("error fetching enriched job_id=%s for DLQ: %v", job.JobID, err)
+			slog.Error("error fetching enriched job for DLQ", "job_id", job.JobID, "error", err)
 			// fall back to publishing the partial job
 			enriched = job
 		}
 		if err := p.producer.Publish(ctx, dlqTopic, enriched); err != nil {
-			log.Printf("error publishing job_id=%s to DLQ: %v", job.JobID, err)
+			slog.Error("error publishing job to DLQ", "job_id", job.JobID, "error", err)
 		}
+		metrics.JobsDLQ.Inc()
 		return
 	}
 
 	// wait = base(2s) * 2^attempt_count + random(0, 1000ms)
 	backoff := backoffBase*time.Duration(1<<uint(attemptCount)) +
 		time.Duration(rand.Intn(1000))*time.Millisecond
-	log.Printf("requeueing job_id=%s worker_id=%s (attempt=%d max=%d) after backoff=%s",
-		job.JobID, p.workerID, attemptCount, p.maxRetries, backoff)
+	slog.Info("requeueing job after backoff",
+		"job_id", job.JobID, "worker_id", p.workerID,
+		"attempt", attemptCount, "max", p.maxRetries, "backoff", backoff.String())
 
 	select {
 	case <-time.After(backoff):
 	case <-ctx.Done():
-		log.Printf("backoff interrupted for job_id=%s during shutdown", job.JobID)
+		slog.Warn("backoff interrupted during shutdown", "job_id", job.JobID)
 		return
 	}
 
 	if err := p.producer.Publish(ctx, jobsTopic, job); err != nil {
-		log.Printf("error requeueing job_id=%s to jobs topic: %v", job.JobID, err)
+		slog.Error("error requeueing job to jobs topic", "job_id", job.JobID, "error", err)
 	}
+	metrics.JobsFailed.Inc()
 }
